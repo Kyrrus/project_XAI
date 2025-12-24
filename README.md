@@ -1,5 +1,7 @@
 # xAI – Deepfake Audio + X-ray XAI (Streamlit)
 
+DATA et modeles : https://drive.google.com/drive/folders/1-gEu2oPO9F5EmUfNcMH-tjc8vzzKkHRx
+
 Ce repo contient un notebook d’entraînement (`project/training_models.ipynb`) et deux apps Streamlit :
 - `project/app.py` : app principale (PyTorch) pour **Audio (FoR)** + **X-ray (CheXpert proxy)** avec XAI (**Grad‑CAM / LIME / SHAP**).
 - `project/app_deepfake.py` : code “référence” issu du repo externe (TensorFlow/Keras) pour **Audio only** avec XAI (**LIME / Grad‑CAM**).
