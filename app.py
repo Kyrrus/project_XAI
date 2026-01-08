@@ -30,6 +30,17 @@ from pytorch_grad_cam.utils.model_targets import BinaryClassifierOutputTarget, C
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from matplotlib.colors import LinearSegmentedColormap
 
+
+
+# =========================
+# Config
+# =========================
+
+
+st.set_page_config(page_title="Unified XAI (Audio + X-ray)", layout="wide")
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 RED_GREEN = LinearSegmentedColormap.from_list(
     "red_green",
     [
@@ -38,16 +49,6 @@ RED_GREEN = LinearSegmentedColormap.from_list(
         (1.0, (1.0, 0.0, 0.0)),   # positive -> red
     ],
 )
-
-
-
-
-# =========================
-# Config
-# =========================
-st.set_page_config(page_title="Unified XAI (Audio + X-ray)", layout="wide")
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 AUDIO_SR = 16000
 AUDIO_SECONDS = 2.0
@@ -70,8 +71,12 @@ NORM = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
 
 # =========================
-# Utils: preprocessing
+# Utils
 # =========================
+
+
+# == PREPROCESSING ==
+
 def load_wav_bytes(wav_bytes: bytes, target_sr=16000):
     y, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32", always_2d=False)
     if y.ndim > 1:
@@ -160,9 +165,9 @@ def fig_to_rgb_uint8(fig) -> np.ndarray:
     return np.array(img)
 
 
-# =========================
-# Models loading
-# =========================
+# == MODELS LOADING ==
+
+
 def build_model_audio(name: str) -> nn.Module:
     if name == "audio_vgg16":
         m = models.vgg16(weights=None)
@@ -208,9 +213,10 @@ def load_model(model_key: str) -> nn.Module:
     return model
 
 
-# =========================
-# Prediction helpers
-# =========================
+
+# == Prediction helpers ==
+
+
 @torch.inference_mode()
 def predict_proba(model: nn.Module, x: torch.Tensor) -> np.ndarray:
     logit = model(x)  # (1,1)
@@ -222,6 +228,8 @@ def predict_proba(model: nn.Module, x: torch.Tensor) -> np.ndarray:
 # =========================
 # XAI: Grad-CAM
 # =========================
+
+
 def find_last_conv_layer(model: nn.Module):
     last = None
     for m in model.modules():
@@ -297,6 +305,8 @@ def gradcam_explain(
 # =========================
 # XAI: LIME
 # =========================
+
+
 def lime_explain(rgb_uint8: np.ndarray, model: nn.Module):
     def classifier_fn(images):
         # images: list/np array of (H,W,3) uint8
@@ -324,6 +334,8 @@ def lime_explain(rgb_uint8: np.ndarray, model: nn.Module):
 # =========================
 # XAI: SHAP
 # =========================
+
+
 def shap_explain(rgb_uint8: np.ndarray, model: nn.Module, class_names):
     # SHAP image explainer (slow): keep it bounded
     def f(images):
@@ -377,6 +389,8 @@ def shap_explain(rgb_uint8: np.ndarray, model: nn.Module, class_names):
 # =========================
 # UI
 # =========================
+
+
 def available_xai(modality: str):
     # pour ton projet de base: LIME/SHAP/Grad-CAM partout
     # (si tu ajoutes une XAI audio-only plus tard, tu la filtreras ici)
@@ -429,7 +443,7 @@ def main():
     model = load_model(model_key)
     file_bytes = up.getvalue()
 
-    # ---- Prepare input as RGB uint8 + torch tensor
+    # Prepare input as RGB uint8 + torch tensor
     if modality.startswith("Audio"):
         rgb_uint8 = wav_bytes_to_melspec_rgb_uint8_matplotlib(file_bytes)
         x = rgb_uint8_to_input_tensor(rgb_uint8)
@@ -442,7 +456,7 @@ def main():
     pred_label = class_names[cls]
     pred_score = float(probs[cls])
 
-    # ---- Tab Single
+    # Tab Single
     with tab1:
         c1, c2 = st.columns([1, 1])
 
@@ -464,7 +478,7 @@ def main():
         out = run_xai(xai_single, model, x, rgb_uint8, class_names, model_key)
         st.image(out, use_container_width=True)
 
-    # ---- Tab Compare
+    # Tab Compare
     with tab2:
         st.subheader("Compare XAI methods")
         if len(xai_multi) == 0:
@@ -479,6 +493,8 @@ def main():
                 st.image(out, use_container_width=True)
 
         st.caption("Note: SHAP can be slow; we cap max_evals to keep it usable.")
+
+
 
 if __name__ == "__main__":
     main()
