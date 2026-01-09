@@ -17,15 +17,13 @@
 
 - [xAI – Deepfake Audio + X-ray XAI Streamlit](#xai--deepfake-audio--x-ray-xai-streamlit)
     - [Datasets](#datasets)
+    - [Installation et Lancement de l'Application](#installation-et-lancement-de-lapplication)
     - [Structure](#structure)
-    - [Lancer l’app PyTorch](#lancer-lapp-pytorch)
-    - [Entraîner / générer les poids](#entra%C3%AEner--g%C3%A9n%C3%A9rer-les-poids)
-    - [Différences clés : app.py vs app_deepfake.py](#diff%C3%A9rences-cl%C3%A9s--apppy-vs-app_deepfakepy)
         - [Framework & modèles](#framework--mod%C3%A8les)
         - [Données supportées](#donn%C3%A9es-support%C3%A9es)
         - [Pré‑traitement important pour la “forme” des XAI](#pr%C3%A9%E2%80%91traitement-important-pour-la-forme-des-xai)
         - [XAI disponibles](#xai-disponibles)
-        - [Interprétation des couleurs SHAP rouge/vert dans app.py](#interpr%C3%A9tation-des-couleurs-shap-rougevert-dans-apppy)
+    - [Entraîner / générer les poids](#entra%C3%AEner--g%C3%A9n%C3%A9rer-les-poids)
     - [Notes pratiques](#notes-pratiques)
 
 <!-- /TOC -->
@@ -39,26 +37,16 @@ https://drive.google.com/drive/folders/1-gEu2oPO9F5EmUfNcMH-tjc8vzzKkHRx
 
 Placez ce dossier `weights` dans la racine du projet.
 
-Les datasets utilisés peuvent être retrouvé aux liens suivants:
+Les datasets utilisés pour l'entrtraînement peuvent être retrouvé aux liens suivants (ils ne sont pas nécessaire pour lancer l'application):
 - [FoR Dataset (https://www.kaggle.com)](https://www.kaggle.com/datasets/mohammedabdeldayem/the-fake-or-real-dataset?select=for-norm) (licence [LGPLv3](https://www.gnu.org/licenses/lgpl-3.0.html))
 - [CheXpert-v1.0-small (https://www.kaggle.com)](https://www.kaggle.com/datasets/ashery/chexpert) (licence [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/))
+
+Si vous souhaitez les spectogrames sous formes d'images, exécutez les 3 premières cellules du notebook `training_models.ipynb`
 
 > Toute les informations sur comment le dataset a été formé sont décrites sur le lien.
 
 
-## **Structure**
-
-Ce repo contient un notebook d’entraînement (`project/training_models.ipynb`) et deux apps Streamlit.<br>
-`project/app.py` : app principale (PyTorch) pour **Audio (FoR)** + **X-ray (CheXpert proxy)** avec XAI (**Grad‑CAM / LIME / SHAP**).<br>
-`project/app_deepfake.py` : code “référence” issu du repo externe (TensorFlow/Keras) pour **Audio only** avec XAI (**LIME / Grad‑CAM**).
-
-- `project/app.py` : UI Streamlit + chargement modèles `.pt` + XAI.
-- `project/app_deepfake.py` : UI Streamlit “legacy” (Keras) + spectrogramme via PNG + LIME + Grad‑CAM TF.
-- `project/training_models.ipynb` : entraînement des modèles (PyTorch) et sauvegarde des poids.
-- `project/weights/` : poids des modèles PyTorch exportés (`*.pt`).
-
-
-## Lancer l’app (PyTorch)
+## **Installation et Lancement de l'Application**
 
 
 Créer un environement python virtuel (recommandé) et activez le:
@@ -85,55 +73,48 @@ py -m streamlit run app.py
 Pré‑requis : Les poids doivent exister dans `./weights/` (les clés sont définies dans `project/app.py`).
 
 
+## **Structure**
+
+Ce repo contient un notebook d’entraînement (`project/training_models.ipynb`) et une app Streamlit `project/app.py`.
+
+- `./weights/` : poids des modèles PyTorch exportés (`*.pt`).
+- `./app.py` : UI Streamlit
+- `./training_models.ipynb` : entraînement des modèles (PyTorch) et sauvegarde des poids.
+
+
+### Framework & modèles
+
+- Charge les modèles torchvision: 
+  - VGG16/ResNet50/MobileNetV2 pour audio.
+  - AlexNet/DenseNet121 pour X‑ray.
+- Restaure les poids depuis `./weights/*.pt`.
+- Prédiction binaire via **logit** + `sigmoid`.
+
+### Données supportées
+
+- Audio `.wav` → image (mel‑spectrogram) → modèle image.
+- X‑ray (`png/jpg/jpeg`) → modèle image.
+
+### Pré‑traitement (important pour la “forme” des XAI)
+
+- Audio : génère le spectrogramme comme dans le repo de référence (**matplotlib → PNG → reload**) pour obtenir un rendu visuel plus proche.
+- X‑ray : conversion en grayscale puis RGB + normalisation ImageNet (voir `./training_models.ipynb`).
+
+### XAI disponibles
+
+- **Grad‑CAM** (pytorch‑grad‑cam) : couche cible adaptée pour X‑ray (ReLU final) et mode debug optionnel.
+- **LIME** (lime‑image) : segmentation superpixels + perturbations.
+- **SHAP** (masker image + superpixels) : affichage rouge/vert (positif/négatif).
+  - **Rouge** : régions qui poussent la prédiction vers la classe expliquée (contribution positive).
+  - **Vert** : régions qui la tirent dans l’autre sens (contribution négative).
+
+
 ## Entraîner / générer les poids
 
 
 Si vous voulez rentrainer les modèles, ouvrez et exécutez `project/training_models.ipynb`.<br>
 Les modèles sont sauvegardés dans `./weights/` et ensuite chargés par `./app.py`.
 
-
-## Différences clés : `app.py` vs `app_deepfake.py`
-
-### Framework & modèles
-
-- `project/app.py` (PyTorch) :
-  - charge des modèles torchvision (VGG16/ResNet50/MobileNetV2 pour audio, AlexNet/DenseNet121 pour X‑ray),
-  - restaure les poids depuis `project/weights/*.pt`,
-  - prédiction binaire via **logit** + `sigmoid`.
-- `project/app_deepfake.py` (TensorFlow/Keras) :
-  - charge un modèle Keras (chemin `saved_model/model`),
-  - prédiction via `model.predict` (softmax multi‑classes dans leur code),
-  - application centrée sur l’audio uniquement.
-
-### Données supportées
-
-- `project/app.py` : **2 modalités**
-  - Audio `.wav` → image (mel‑spectrogram) → modèle image.
-  - X‑ray (`png/jpg/jpeg`) → modèle image.
-- `project/app_deepfake.py` : **audio uniquement**
-
-### Pré‑traitement (important pour la “forme” des XAI)
-
-- `project/app.py` :
-  - Audio : génère le spectrogramme comme dans le repo de référence (**matplotlib → PNG → reload**) pour obtenir un rendu visuel plus proche.
-  - X‑ray : conversion en grayscale puis RGB + normalisation ImageNet (comme dans `project/training_models.ipynb`).
-- `project/app_deepfake.py` :
-  - Audio : écrit un PNG `melspectrogram.png`, puis recharge l’image (pipeline disque).
-
-### XAI disponibles
-
-- `project/app.py` :
-  - **Grad‑CAM** (pytorch‑grad‑cam) : couche cible adaptée pour X‑ray (ReLU final) et mode debug optionnel.
-  - **LIME** (lime‑image) : segmentation superpixels + perturbations.
-  - **SHAP** (masker image + superpixels) : affichage rouge/vert (positif/négatif) style “paper”.
-- `project/app_deepfake.py` :
-  - **LIME** et **Grad‑CAM** (implémentation TF “maison”).
-  - Pas de SHAP.
-
-### Interprétation des couleurs (SHAP rouge/vert dans `app.py`)
-
-- **Rouge** : régions qui poussent la prédiction vers la classe expliquée (contribution positive).
-- **Vert** : régions qui la tirent dans l’autre sens (contribution négative).
 
 ## Notes pratiques
 
