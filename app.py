@@ -42,7 +42,7 @@ from matplotlib.colors import LinearSegmentedColormap
 
 st.set_page_config(page_title="Unified XAI (Audio + X-ray)", layout="wide")
 
-# Created custom style.
+# Custom CSS for Streamlit components: metrics, XAI loading, hover overlay
 st.markdown(
         """
         <style>
@@ -168,6 +168,8 @@ NORM = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 # == PREPROCESSING ==
 
 def load_wav_bytes(wav_bytes: bytes, target_sr=16000):
+    """Load WAV bytes, convert to mono, resample to target_sr."""
+
     y, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32", always_2d=False)
     if y.ndim > 1:
         y = y.mean(axis=1)
@@ -178,6 +180,8 @@ def load_wav_bytes(wav_bytes: bytes, target_sr=16000):
 
 
 def pad_or_trim(y: np.ndarray, sr: int, seconds: float):
+
+    """Pad with zeros or trim it"""
     Tt = int(sr * seconds)
     if len(y) < Tt:
         y = np.pad(y, (0, Tt - len(y)), mode="constant")
@@ -185,26 +189,33 @@ def pad_or_trim(y: np.ndarray, sr: int, seconds: float):
         y = y[:Tt]
     return y
 
+# # This one is Deprecated: instead using matplotlib for a better visualization (see below)
+# def wav_to_melspec_rgb_uint8(y: np.ndarray, sr: int):
+#     """Wav file to Mel-spectrogram image"""
 
-def wav_to_melspec_rgb_uint8(y: np.ndarray, sr: int):
-    # MelSpectrogram -> dB -> normalize 0..255
-    S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128, fmin=20, fmax=8000, power=2.0)
-    S_db = librosa.power_to_db(S, ref=np.max)
-    S_norm = (S_db - S_db.min()) / (S_db.max() - S_db.min() + 1e-9)
-    img = (S_norm * 255.0).astype(np.uint8)  # (H, W)
+#     # MelSpectrogram -> dB -> normalize 0..255
+#     S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128, fmin=20, fmax=8000, power=2.0)
+#     S_db = librosa.power_to_db(S, ref=np.max)
+#     S_norm = (S_db - S_db.min()) / (S_db.max() - S_db.min() + 1e-9)
+#     img = (S_norm * 255.0).astype(np.uint8)  # (H, W)
 
-    # convert to RGB by stacking, then resize to 224x224
-    pil = Image.fromarray(img).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
-    return np.array(pil).astype(np.uint8)  # (224,224,3)
+#     # convert to RGB by stacking, then resize to 224x224
+#     pil = Image.fromarray(img).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
+#     return np.array(pil).astype(np.uint8)  # (224,224,3)
 
 def wav_bytes_to_melspec_rgb_uint8_matplotlib(wav_bytes: bytes):
+    """Wav file bytes to Mel-spectrogram image with matplotlib"""
+
     wav_path = None
     png_path = None
+
     try:
+        # write temp file
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             f.write(wav_bytes)
             wav_path = f.name
 
+        # load and plot
         y, sr = librosa.load(wav_path)
         fig = plt.figure()
         ax = fig.add_subplot(1, 1, 1)
@@ -214,6 +225,7 @@ def wav_bytes_to_melspec_rgb_uint8_matplotlib(wav_bytes: bytes):
         log_ms = librosa.power_to_db(ms, ref=np.max)
         librosa.display.specshow(log_ms, sr=sr)
 
+        # save to temp png
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
             png_path = f.name
         plt.savefig(png_path)
@@ -221,6 +233,8 @@ def wav_bytes_to_melspec_rgb_uint8_matplotlib(wav_bytes: bytes):
 
         img = Image.open(png_path).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
         return np.array(img).astype(np.uint8)
+    
+    # Regardless of success or failure, make sure to clean up the temp files.
     finally:
         if wav_path and os.path.exists(wav_path):
             os.remove(wav_path)
@@ -229,23 +243,166 @@ def wav_bytes_to_melspec_rgb_uint8_matplotlib(wav_bytes: bytes):
 
 
 def xray_bytes_to_rgb_uint8(img_bytes: bytes):
+    """X-ray image bytes to RGB array for model input"""
+
     pil = Image.open(io.BytesIO(img_bytes)).convert("L").resize((IMG_SIZE, IMG_SIZE))
     pil = pil.convert("RGB")
     return np.array(pil).astype(np.uint8)
 
 
 def spectrogram_image_bytes_to_rgb_uint8(img_bytes: bytes):
+    """Spectrogram image bytes to RGB array for model input"""
+
     pil = Image.open(io.BytesIO(img_bytes)).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
     return np.array(pil).astype(np.uint8)
 
 
+def _autocrop_spectrogram_region(rgb_uint8: np.ndarray) -> np.ndarray:
+    """Best-effort crop to remove borders/axes from a plotted spectrogram image."""
+
+    rgb = _to_uint8(rgb_uint8)
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        return rgb
+
+    gray = (0.2126 * rgb[:, :, 0] + 0.7152 * rgb[:, :, 1] + 0.0722 * rgb[:, :, 2]).astype(np.float32)
+
+    # Find rows/cols with enough variance (content vs uniform background).
+    row_std = gray.std(axis=1)
+    col_std = gray.std(axis=0)
+
+    r = np.where(row_std > 2.0)[0]
+    c = np.where(col_std > 2.0)[0]
+    if r.size == 0 or c.size == 0:
+        return rgb
+
+    r0, r1 = int(r[0]), int(r[-1])
+    c0, c1 = int(c[0]), int(c[-1])
+
+    # Keep a small safety margin.
+    pad = 2
+    r0 = max(0, r0 - pad)
+    c0 = max(0, c0 - pad)
+    r1 = min(rgb.shape[0] - 1, r1 + pad)
+    c1 = min(rgb.shape[1] - 1, c1 + pad)
+
+    if (r1 - r0) < 20 or (c1 - c0) < 20:
+        return rgb
+    return rgb[r0 : r1 + 1, c0 : c1 + 1]
+
+
+def _rgb_to_colormap_scalar(rgb_uint8: np.ndarray, cmap_name: str = "magma") -> np.ndarray:
+    """Invert a Matplotlib colormap to approximate a scalar field in [0, 1]."""
+
+    rgb = _to_uint8(rgb_uint8)
+    h, w, _ = rgb.shape
+
+    cmap = plt.get_cmap(cmap_name)
+    k = 256
+    lut = cmap(np.linspace(0, 1, k))[:, :3].astype(np.float32)  # (k, 3)
+
+    p = (rgb.reshape(-1, 3).astype(np.float32) / 255.0)  # (n, 3)
+    p2 = np.sum(p * p, axis=1, keepdims=True)  # (n, 1)
+    c2 = np.sum(lut * lut, axis=1, keepdims=True).T  # (1, k)
+    pc = p @ lut.T  # (n, k)
+    dist2 = p2 + c2 - 2.0 * pc
+    idx = np.argmin(dist2, axis=1).astype(np.float32)
+    return (idx / float(k - 1)).reshape(h, w).clip(0.0, 1.0)
+
+
+def _reconstruction_quality_score(y: np.ndarray, sr: int) -> float:
+    """Heuristic score to pick between vertical flip options."""
+
+    if y is None or y.size == 0:
+        return -1e9
+    y = y.astype(np.float32)
+    y = y - float(y.mean())
+    rms = float(np.sqrt(np.mean(y * y)))
+    if not np.isfinite(rms) or rms <= 1e-8:
+        return -1e9
+
+    centroid = librosa.feature.spectral_centroid(y=y, sr=sr)
+    centroid_hz = float(np.nanmedian(centroid)) if centroid.size else float("nan")
+    if not np.isfinite(centroid_hz):
+        centroid_hz = sr / 4.0
+
+    # Prefer centroid around ~2.5kHz for speech-like audio; punish extremes.
+    target = 2500.0
+    centroid_penalty = abs(centroid_hz - target) / target
+    return -centroid_penalty + np.log(rms + 1e-8)
+
+
+@st.cache_data(show_spinner=False)
+def reconstruct_wav_from_spectrogram_image_bytes(
+    img_bytes: bytes,
+    *,
+    sr: int = AUDIO_SR,
+    seconds: float = AUDIO_SECONDS,
+    cmap_name: str = "magma",
+    min_db: float = -80.0,
+    max_db: float = 0.0,
+    n_fft: int = 1024,
+    hop_length: int = 256,
+    n_iter: int = 32,
+) -> bytes:
+    """Reconstruct a WAV preview from a spectrogram image (best-effort).
+
+    Note: This cannot recover the original audio perfectly (phase + scaling are lost).
+    """
+
+    pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    rgb = np.array(pil).astype(np.uint8)
+    rgb = _autocrop_spectrogram_region(rgb)
+
+    scalar = _rgb_to_colormap_scalar(rgb, cmap_name=cmap_name)
+    db = (min_db + scalar * (max_db - min_db)).astype(np.float32)
+    mel_power_a = librosa.db_to_power(db, ref=1.0).astype(np.float32)
+    mel_power_b = np.flipud(mel_power_a)
+
+    target_len = int(sr * seconds)
+
+    y_a = librosa.feature.inverse.mel_to_audio(
+        mel_power_a,
+        sr=sr,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        power=2.0,
+        n_iter=n_iter,
+        length=target_len,
+    ).astype(np.float32)
+    y_b = librosa.feature.inverse.mel_to_audio(
+        mel_power_b,
+        sr=sr,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        power=2.0,
+        n_iter=n_iter,
+        length=target_len,
+    ).astype(np.float32)
+
+    score_a = _reconstruction_quality_score(y_a, sr)
+    score_b = _reconstruction_quality_score(y_b, sr)
+    y = y_a if score_a >= score_b else y_b
+
+    peak = float(np.max(np.abs(y))) if y.size else 0.0
+    if peak > 1e-8:
+        y = (0.98 * y / peak).astype(np.float32)
+
+    buf = io.BytesIO()
+    sf.write(buf, y, sr, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
 def rgb_uint8_to_input_tensor(rgb: np.ndarray):
+    """RGB image to normalized torch tensor for model input"""
+
     pil = Image.fromarray(rgb)
     x = T.ToTensor()(pil)  # 0..1
     x = NORM(x)
     return x.unsqueeze(0).to(DEVICE)
 
 def _to_uint8(image: np.ndarray) -> np.ndarray:
+    """Transform image to uint8 format if needed."""
+
     if image.dtype != np.uint8:
         if image.max() <= 1.0:
             image = (image * 255.0).round()
@@ -253,6 +410,8 @@ def _to_uint8(image: np.ndarray) -> np.ndarray:
     return image
 
 def fig_to_rgb_uint8(fig) -> np.ndarray:
+    """ Convert a Matplotlib figure to an RGB array."""
+
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0)
     buf.seek(0)
@@ -260,26 +419,33 @@ def fig_to_rgb_uint8(fig) -> np.ndarray:
     return np.array(img)
 
 def _rgb_uint8_to_png_bytes(rgb_uint8: np.ndarray) -> bytes:
+    """Convert RGB array to PNG bytes."""
+
     pil = Image.fromarray(_to_uint8(rgb_uint8)).convert("RGB")
     buf = io.BytesIO()
     pil.save(buf, format="PNG")
     return buf.getvalue()
 
 def _img_to_data_uri_png(image: np.ndarray) -> str:
+    """Convert RGB array to data URI PNG string."""
+
     png = _rgb_uint8_to_png_bytes(image)
     b64 = base64.b64encode(png).decode("ascii")
     return f"data:image/png;base64,{b64}"
 
 
 def _render_hover_overlay_component(
-        xai_uri: str,
-        orig_uri: str,
-        *,
-        border_radius_px: int = 14,
+    xai_uri: str,
+    orig_uri: str,
+    *,
+    border_radius_px: int = 14,
 ):
-        # Use components.html to avoid Streamlit Markdown max-width constraints.
-        # This renders in an iframe that can expand to the full column width.
-        html = f"""
+    """Render a hover overlay component using HTML/CSS in Streamlit.
+    Shows the XAI image by default, and on hover shows the original image."""
+        
+    # Use components.html to avoid Streamlit Markdown max-width constraints.
+    # This renders in an iframe that can expand to the full column width.
+    html = f"""
         <style>
             html, body {{ margin: 0; padding: 0; }}
             .xai-hover {{
@@ -331,12 +497,14 @@ def _render_hover_overlay_component(
                 setTimeout(resizeFrameToSquare, 200);
             }})();
         </script>
-        """
-        # Height auto-adjusted by the JS above.
-        components.html(html, height=10, scrolling=False)
+    """
+    # Height auto-adjusted by the JS above.
+    components.html(html, height=10, scrolling=False)
 
 
 def _resize_rgb_uint8_to_match(image: np.ndarray, target_rgb_uint8: np.ndarray) -> np.ndarray:
+    """Resize image to match target shape if needed."""
+
     image = _to_uint8(image)
     target_rgb_uint8 = _to_uint8(target_rgb_uint8)
     if image.ndim != 3 or image.shape[2] != 3:
@@ -349,8 +517,15 @@ def _resize_rgb_uint8_to_match(image: np.ndarray, target_rgb_uint8: np.ndarray) 
 
 # == MODELS LOADING ==
 
-
 def build_model_audio(name: str) -> nn.Module:
+    """
+    Build the audio model based on the name.
+    Possible names are "audio_vgg16", "audio_resnet50", "audio_mobilenetv2".
+    The training of the model are in the training_models.ipynb notebook.
+
+    Change the final layer to output 1 logit for binary classification.
+    """
+
     if name == "audio_vgg16":
         m = models.vgg16(weights=None)
         m.classifier[-1] = nn.Linear(m.classifier[-1].in_features, 1)  # 1 logit
@@ -363,10 +538,19 @@ def build_model_audio(name: str) -> nn.Module:
         m = models.mobilenet_v2(weights=None)
         m.classifier[-1] = nn.Linear(m.classifier[-1].in_features, 1)  # 1 logit
         return m
+    
     raise ValueError("Unknown audio model")
 
 
 def build_model_xray(name: str) -> nn.Module:
+    """
+    Build the xray model based on the name.
+    Possible names are "xray_alexnet", "xray_densenet121".
+    The training of the model are in the training_models.ipynb notebook.
+
+    Change the final layer to output 1 logit for binary classification.
+    """
+
     if name == "xray_alexnet":
         m = models.alexnet(weights=None)
         m.classifier[-1] = nn.Linear(m.classifier[-1].in_features, 1)  # 1 logit
@@ -375,11 +559,14 @@ def build_model_xray(name: str) -> nn.Module:
         m = models.densenet121(weights=None)
         m.classifier = nn.Linear(m.classifier.in_features, 1)  # 1 logit
         return m
+    
     raise ValueError("Unknown xray model")
 
 
 @st.cache_resource
 def load_model(model_key: str) -> nn.Module:
+    """Function that load a model"""
+
     ckpt = WEIGHTS[model_key]
     if not os.path.exists(ckpt):
         raise FileNotFoundError(f"Missing weights: {ckpt}")
@@ -395,12 +582,12 @@ def load_model(model_key: str) -> nn.Module:
     return model
 
 
-
 # == Prediction helpers ==
-
 
 @torch.inference_mode()
 def predict_proba(model: nn.Module, x: torch.Tensor) -> np.ndarray:
+    """Predict probability for binary classification model outputting 1 logit."""
+
     logit = model(x)  # (1,1)
     p1 = torch.sigmoid(logit)[0, 0].detach().cpu().item()
     p0 = 1.0 - p1
@@ -413,6 +600,7 @@ def predict_proba(model: nn.Module, x: torch.Tensor) -> np.ndarray:
 
 
 def find_last_conv_layer(model: nn.Module):
+    """Find the last Conv2d layer in the model. Used for Grad-CAM."""
     last = None
     for m in model.modules():
         if isinstance(m, nn.Conv2d):
@@ -422,6 +610,7 @@ def find_last_conv_layer(model: nn.Module):
     return last
 
 def find_last_relu_layer(model: nn.Module):
+    """FFind the last ReLU layer in the model. Used for Grad-CAM."""
     last = None
     for m in model.modules():
         if isinstance(m, nn.ReLU):
@@ -431,6 +620,9 @@ def find_last_relu_layer(model: nn.Module):
     return last
 
 class TwoClassWrapper(nn.Module):
+    """Small class to wrap a binary classifier outputting 1 logit 
+    into a 2-class classifier outputting 2 logits (for Grad-CAM)."""
+
     def __init__(self, base: nn.Module):
         super().__init__()
         self.base = base
@@ -442,6 +634,9 @@ class TwoClassWrapper(nn.Module):
         return torch.cat([-logit, logit], dim=1)
 
 def get_gradcam_target_layers(model: nn.Module, model_key: str):
+    """Get the grad-CAM target layers based on the model type.
+    Fallback to last conv layer if no specific rule for this model."""
+
     if model_key == "xray_alexnet":
         if hasattr(model, "features") and len(model.features) > 11:
             return [model.features[11]]  # last ReLU after final conv
@@ -462,17 +657,23 @@ def gradcam_explain(
     class_idx: int,
     model_key: str,
 ):
+    """Grad-CAM explanation function."""
+
+    # setup Grad-CAM
     target_layers = get_gradcam_target_layers(model, model_key)
+    # xray models needs to wrap to 2-class output
     if model_key.startswith("xray_"):
         wrapped = TwoClassWrapper(model).eval()
         cam = GradCAM(model=wrapped, target_layers=target_layers)
         cam.compute_input_gradient = True
         targets = [ClassifierOutputSoftmaxTarget(class_idx)]
+    # for audio models, keep as is
     else:
         cam = GradCAM(model=model, target_layers=target_layers)
         targets = [BinaryClassifierOutputTarget(class_idx)]
     grayscale_cam = cam(input_tensor=x, targets=targets)[0]  # (H,W) in [0,1] approx
 
+    # overlay heatmap on image
     heat = np.uint8(255 * grayscale_cam)
     if cv2 is not None:
         heat = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
@@ -481,6 +682,7 @@ def gradcam_explain(
         return overlay
 
     rgb_float = (rgb_uint8.astype(np.float32) / 255.0)
+
     return show_cam_on_image(rgb_float, grayscale_cam, use_rgb=True)
 
 
@@ -490,6 +692,8 @@ def gradcam_explain(
 
 
 def lime_explain(rgb_uint8: np.ndarray, model: nn.Module):
+    """LIME explanation function."""
+
     def classifier_fn(images):
         # images: list/np array of (H,W,3) uint8
         out = []
@@ -499,7 +703,9 @@ def lime_explain(rgb_uint8: np.ndarray, model: nn.Module):
             out.append(p)
         return np.array(out, dtype=np.float32)
 
+    # setup LIME explainer
     explainer = lime_image.LimeImageExplainer()
+
     exp = explainer.explain_instance(
         rgb_uint8.astype(np.uint8),
         classifier_fn=classifier_fn,
@@ -507,6 +713,8 @@ def lime_explain(rgb_uint8: np.ndarray, model: nn.Module):
         hide_color=0,
         num_samples=1000
     )
+
+    # get explanation for the predicted label
     label = int(np.argmax(predict_proba(model, rgb_uint8_to_input_tensor(rgb_uint8.astype(np.uint8)))))
     temp, mask = exp.get_image_and_mask(label, positive_only=False, num_features=8, hide_rest=True)
     vis = mark_boundaries(temp / 255.0, mask)
@@ -519,8 +727,10 @@ def lime_explain(rgb_uint8: np.ndarray, model: nn.Module):
 
 
 def shap_explain(rgb_uint8: np.ndarray, model: nn.Module, class_names):
-    # SHAP image explainer (slow): keep it bounded
+    """SHAP explanation function"""
+
     def f(images):
+        # images is array of (H,W,3). return (N,C) array of probabilities
         out = []
         for im in images:
             x = rgb_uint8_to_input_tensor(_to_uint8(im))
@@ -533,6 +743,7 @@ def shap_explain(rgb_uint8: np.ndarray, model: nn.Module, class_names):
     masker = shap.maskers.Image("blur(64,64)", img_float.shape)
     explainer = shap.Explainer(f, masker, output_names=class_names)
 
+    # compute SHAP values
     sv = explainer(img_float[None, ...], max_evals=1000, batch_size=8)
     probs = f(img_float[None, ...])[0]
     cls = int(np.argmax(probs))
@@ -540,17 +751,20 @@ def shap_explain(rgb_uint8: np.ndarray, model: nn.Module, class_names):
     vals = sv.values[0, :, :, :, cls]  # (H,W,3)
     sv2d = vals.sum(axis=-1)
 
+    # segment + average within segments
     segments = slic(img_float, n_segments=120, compactness=10, sigma=1, start_label=0)
     sv_seg = np.zeros_like(sv2d)
     for seg_id in np.unique(segments):
         mask = segments == seg_id
         sv_seg[mask] = sv2d[mask].mean()
 
+    # separate positive and negative impacts, scale by 99th percentile for visualization
     pos = sv_seg[sv_seg > 0]
     neg = -sv_seg[sv_seg < 0]
     pos_scale = np.nanpercentile(pos, 99) if pos.size else 1.0
     neg_scale = np.nanpercentile(neg, 99) if neg.size else 1.0
 
+    # normalize
     sv_norm = np.zeros_like(sv_seg)
     if pos_scale > 0:
         sv_norm[sv_seg > 0] = sv_seg[sv_seg > 0] / pos_scale
@@ -558,6 +772,7 @@ def shap_explain(rgb_uint8: np.ndarray, model: nn.Module, class_names):
         sv_norm[sv_seg < 0] = sv_seg[sv_seg < 0] / neg_scale
     sv_norm = np.clip(sv_norm, -1, 1)
 
+    # overlay on original image (gray scale)
     x_gray = 0.2989 * img_float[:, :, 0] + 0.5870 * img_float[:, :, 1] + 0.1140 * img_float[:, :, 2]
     fig, ax = plt.subplots()
     ax.imshow(x_gray, cmap=plt.get_cmap("gray"), alpha=0.12)
@@ -565,6 +780,7 @@ def shap_explain(rgb_uint8: np.ndarray, model: nn.Module, class_names):
     ax.axis("off")
     out = fig_to_rgb_uint8(fig)
     plt.close(fig)
+
     return out
 
 
@@ -585,6 +801,8 @@ def run_xai(
     class_names,
     model_key: str,
 ):
+    """Utils that runs the XAI method selected."""
+
     probs = predict_proba(model, x)
     cls = int(np.argmax(probs))
     if method == "Grad-CAM":
@@ -597,14 +815,18 @@ def run_xai(
 
 
 def main():
+    """Main Streamlit app function."""
     
+    # Title
     st.title("Unified Explainable AI Interface")
     st.caption(f"Device: {DEVICE}")
 
+    # Sidebar
     with st.sidebar:
 
         st.header("Configuration", divider="red")
 
+        # Select the type of data/task
         section = st.radio(
             "Section",
             ["Deepfake audio detection", "Lung cancer detection"],
@@ -613,26 +835,31 @@ def main():
 
         st.divider()
 
+        # Depending of the task chosen
         if section == "Deepfake audio detection":
+            # Audio uploader
             modality = "Audio"
             up = st.file_uploader(
                 "Upload audio (.wav) or spectrogram image",
                 type=["wav", "png", "jpg", "jpeg"],
             )
             st.divider()
+            # model selection
             model_key = st.selectbox("Audio model", ["audio_vgg16", "audio_resnet50", "audio_mobilenetv2"])
             class_names = AUDIO_CLASSES
         else:
+            # X-ray uploader
             modality = "X-ray (image)"
             up = st.file_uploader("Upload chest X-ray image", type=["png", "jpg", "jpeg"])
             st.divider()
+            # model selection
             model_key = st.selectbox("X-ray model", ["xray_alexnet", "xray_densenet121"])
             class_names = XRAY_CLASSES
 
         if up is None:
             st.stop()
 
-        # XAI methods are fixed for this app
+        # deprecated variables. Before xai methods were variables but both task are on image input.
         xai_single = "Grad-CAM"
         xai_multi = ["Grad-CAM", "LIME", "SHAP"]
 
@@ -644,6 +871,10 @@ def main():
     file_bytes = up.getvalue()
 
     # Clear cached XAI + image URIs whenever a new file is uploaded.
+    # Images are cached in session_state for performance and because the overlay 
+    # refresh the page and would restart the xai computation.
+    # Deleted otherwise if same file is uploaded again won't recompute xai even 
+    # tho not the same output or even model and free spaces.
     # (Model weights remain cached via st.cache_resource.)
     input_sig = hashlib.sha1(file_bytes).hexdigest()
     last_sig_key = f"last_input_sig_{section}"
@@ -652,6 +883,7 @@ def main():
         st.session_state["xai_cache"] = {}
         st.session_state["uri_cache"] = {}
 
+    # Determine if the uploaded file is a WAV audio file to support both audio and spectrogram image inputs.
     is_wav_audio = (
         section == "Deepfake audio detection"
         and hasattr(up, "name")
@@ -659,8 +891,9 @@ def main():
         and up.name.lower().endswith(".wav")
     )
 
-    # Prepare input as RGB uint8 + torch tensor
+    # Prepare input as RGB + torch tensor
     if section == "Deepfake audio detection":
+        # support of .wav file
         if is_wav_audio:
             rgb_uint8 = wav_bytes_to_melspec_rgb_uint8_matplotlib(file_bytes)
         else:
@@ -670,6 +903,7 @@ def main():
         rgb_uint8 = xray_bytes_to_rgb_uint8(file_bytes)
         x = rgb_uint8_to_input_tensor(rgb_uint8)
 
+    # Prediction
     probs = predict_proba(model, x)
     cls = int(np.argmax(probs))
     pred_label = class_names[cls]
@@ -679,6 +913,7 @@ def main():
     with tab1:
         c1, c2 = st.columns([1, 1])
 
+        # show image input + audio if applicable
         with c1:
             st.subheader("Input")
             if section == "Deepfake audio detection":
@@ -687,9 +922,18 @@ def main():
                     st.audio(file_bytes, format="audio/wav")
                 else:
                     st.image(rgb_uint8, caption="Spectrogram image", use_container_width=True)
+
+                    # Automatically make the image-upload case listenable.
+                    with st.spinner("Reconstructing audio from spectrogram image…"):
+                        try:
+                            wav_preview = reconstruct_wav_from_spectrogram_image_bytes(file_bytes)
+                            st.audio(wav_preview, format="audio/wav")
+                        except Exception as e:
+                            st.warning(f"Could not reconstruct audio from this image: {e}")
             else:
                 st.image(rgb_uint8, caption="X-ray (RGB view)", use_container_width=True)
 
+        # Show metrics and results
         with c2:
             st.subheader("Prediction")
             m1, m2 = st.columns(2)
@@ -712,7 +956,7 @@ def main():
 
             st.json({class_names[i]: float(probs[i]) for i in range(len(class_names))})
 
-        ## XAI single output deprecated for Compare tab
+        # # XAI single output deprecated for Compare tab
         # st.divider()
         # st.subheader(f"XAI: {xai_single}")
         # out = run_xai(xai_single, model, x, rgb_uint8, class_names, model_key)
@@ -740,16 +984,20 @@ def main():
             uri_cache[orig_uri_key] = _img_to_data_uri_png(_to_uint8(rgb_uint8))
         orig_uri = uri_cache[orig_uri_key]
         
+        # For each XAI method, compute and display
         for i, method in enumerate(xai_multi):
+
             with cols[i % len(cols)]:
                 st.markdown(f"### {method}")
 
+                # Spinner placeholder
                 placeholder = st.empty()
                 placeholder.markdown(
                     '<div class="xai-loading"><div class="xai-spinner"></div></div>',
                     unsafe_allow_html=True,
                 )
-
+                
+                # check cache to display xai result if already computed
                 cache_key = (section, model_key, input_sig, method)
                 if cache_key in xai_cache:
                     out = xai_cache[cache_key]
@@ -758,7 +1006,7 @@ def main():
                     out = _resize_rgb_uint8_to_match(out, rgb_uint8)
                     xai_cache[cache_key] = out
 
-                # Ensure cached outputs are also aligned
+                # Ensure cached outputs are aligned
                 out = _resize_rgb_uint8_to_match(out, rgb_uint8)
 
                 # overlay mode to display the original on hover
