@@ -574,8 +574,6 @@ def shap_explain(rgb_uint8: np.ndarray, model: nn.Module, class_names):
 
 
 def available_xai(modality: str):
-    # pour ton projet de base: LIME/SHAP/Grad-CAM partout
-    # (si tu ajoutes une XAI audio-only plus tard, tu la filtreras ici)
     return ["Grad-CAM", "LIME", "SHAP"]
 
 
@@ -714,7 +712,7 @@ def main():
 
             st.json({class_names[i]: float(probs[i]) for i in range(len(class_names))})
 
-        ## XAI single output
+        ## XAI single output deprecated for Compare tab
         # st.divider()
         # st.subheader(f"XAI: {xai_single}")
         # out = run_xai(xai_single, model, x, rgb_uint8, class_names, model_key)
