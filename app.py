@@ -1,9 +1,12 @@
 import io
 import os
 import tempfile
+import hashlib
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
+import base64
 import matplotlib.pyplot as plt
 
 import torch
@@ -39,6 +42,93 @@ from matplotlib.colors import LinearSegmentedColormap
 
 st.set_page_config(page_title="Unified XAI (Audio + X-ray)", layout="wide")
 
+# Created custom style.
+st.markdown(
+        """
+        <style>
+            /* Ensure HTML-in-markdown blocks can fill the column width */
+            div[data-testid="stMarkdownContainer"] {
+                width: 100% !important;
+                max-width: none !important;
+            }
+            div[data-testid="stMarkdownContainer"] > div {
+                width: 100% !important;
+                max-width: none !important;
+            }
+            div[data-testid="stMarkdownContainer"] p {
+                width: 100% !important;
+                max-width: none !important;
+            }
+
+            /* Metric card */
+            div[data-testid="stMetric"] {
+                background: var(--secondary-background-color);
+                padding: 14px 16px;
+                border-radius: 14px;
+            }
+            div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+                font-size: 1.6rem;
+            }
+
+            /* Loading placeholder for XAI panels */
+            .xai-loading {
+                height: 320px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: var(--secondary-background-color);
+                border-radius: 14px;
+            }
+            .xai-spinner {
+                width: 84px;
+                height: 84px;
+                border-radius: 50%;
+                border: 10px solid rgba(0,0,0,0);
+                border-top-color: var(--text-color);
+                animation: xai-spin 0.9s linear infinite;
+            }
+            @keyframes xai-spin {
+                0% { transform: rotate(0deg); }
+                100% { transform: rotate(360deg); }
+            }
+
+            /* Hover overlay: show XAI, hover -> show original */
+            .xai-hover {
+                position: relative;
+                display: block;
+                width: 100% !important;
+                max-width: 100% !important;
+                box-sizing: border-box;
+                border-radius: 14px;
+                overflow: hidden;
+                background: var(--secondary-background-color);
+            }
+            .xai-hover img {
+                width: 100% !important;
+                max-width: 100% !important;
+                height: auto !important;
+                display: block;
+            }
+            .xai-hover .xai-img {
+                position: relative;
+                z-index: 1;
+                opacity: 1;
+                transition: opacity 120ms ease-in-out;
+            }
+            .xai-hover .orig-img {
+                position: absolute;
+                inset: 0;
+                z-index: 2;
+                opacity: 0;
+                transition: opacity 120ms ease-in-out;
+            }
+            .xai-hover:hover .orig-img { opacity: 1; }
+            .xai-hover:hover .xai-img { opacity: 0; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+)
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 RED_GREEN = LinearSegmentedColormap.from_list(
@@ -55,7 +145,7 @@ AUDIO_SECONDS = 2.0
 IMG_SIZE = 224
 
 # classes
-AUDIO_CLASSES = ["real", "fake"]  # adapte si tu as l'ordre inverse
+AUDIO_CLASSES = ["real", "fake"] 
 XRAY_CLASSES = ["no_opacity", "opacity"]  # proxy "Lung Opacity"
 
 WEIGHTS = {
@@ -144,6 +234,11 @@ def xray_bytes_to_rgb_uint8(img_bytes: bytes):
     return np.array(pil).astype(np.uint8)
 
 
+def spectrogram_image_bytes_to_rgb_uint8(img_bytes: bytes):
+    pil = Image.open(io.BytesIO(img_bytes)).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
+    return np.array(pil).astype(np.uint8)
+
+
 def rgb_uint8_to_input_tensor(rgb: np.ndarray):
     pil = Image.fromarray(rgb)
     x = T.ToTensor()(pil)  # 0..1
@@ -164,6 +259,93 @@ def fig_to_rgb_uint8(fig) -> np.ndarray:
     img = Image.open(buf).convert("RGB")
     return np.array(img)
 
+def _rgb_uint8_to_png_bytes(rgb_uint8: np.ndarray) -> bytes:
+    pil = Image.fromarray(_to_uint8(rgb_uint8)).convert("RGB")
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG")
+    return buf.getvalue()
+
+def _img_to_data_uri_png(image: np.ndarray) -> str:
+    png = _rgb_uint8_to_png_bytes(image)
+    b64 = base64.b64encode(png).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
+def _render_hover_overlay_component(
+        xai_uri: str,
+        orig_uri: str,
+        *,
+        border_radius_px: int = 14,
+):
+        # Use components.html to avoid Streamlit Markdown max-width constraints.
+        # This renders in an iframe that can expand to the full column width.
+        html = f"""
+        <style>
+            html, body {{ margin: 0; padding: 0; }}
+            .xai-hover {{
+                position: relative;
+                width: 100%;
+                aspect-ratio: 1 / 1;
+                border-radius: {border_radius_px}px;
+                overflow: hidden;
+                background: transparent;
+            }}
+            .xai-hover img {{
+                position: absolute;
+                inset: 0;
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+                display: block;
+                transition: opacity 120ms ease-in-out;
+            }}
+            .xai-hover img.xai-img {{ opacity: 1; z-index: 1; }}
+            .xai-hover img.orig-img {{ opacity: 0; z-index: 2; }}
+            .xai-hover:hover img.orig-img {{ opacity: 1; }}
+            .xai-hover:hover img.xai-img {{ opacity: 0; }}
+        </style>
+        <div class="xai-hover">
+            <img class="xai-img" src="{xai_uri}" alt="XAI" />
+            <img class="orig-img" src="{orig_uri}" alt="Original" />
+        </div>
+        <script>
+            (function() {{
+                function resizeFrameToSquare() {{
+                    const el = document.querySelector('.xai-hover');
+                    if (!el) return;
+                    const w = el.getBoundingClientRect().width;
+                    if (!w || w < 10) return;
+
+                    const h = Math.ceil(w);
+                    if (window.frameElement) {{
+                        window.frameElement.style.height = h + 'px';
+                        window.frameElement.style.width = '100%';
+                    }}
+                }}
+
+                // Run soon after render and on resize.
+                window.addEventListener('load', resizeFrameToSquare);
+                window.addEventListener('resize', resizeFrameToSquare);
+                setTimeout(resizeFrameToSquare, 0);
+                setTimeout(resizeFrameToSquare, 50);
+                setTimeout(resizeFrameToSquare, 200);
+            }})();
+        </script>
+        """
+        # Height auto-adjusted by the JS above.
+        components.html(html, height=10, scrolling=False)
+
+
+def _resize_rgb_uint8_to_match(image: np.ndarray, target_rgb_uint8: np.ndarray) -> np.ndarray:
+    image = _to_uint8(image)
+    target_rgb_uint8 = _to_uint8(target_rgb_uint8)
+    if image.ndim != 3 or image.shape[2] != 3:
+        image = np.array(Image.fromarray(image).convert("RGB"))
+    if image.shape[:2] == target_rgb_uint8.shape[:2]:
+        return image
+    pil = Image.fromarray(image).convert("RGB")
+    pil = pil.resize((target_rgb_uint8.shape[1], target_rgb_uint8.shape[0]))
+    return np.array(pil).astype(np.uint8)
 
 # == MODELS LOADING ==
 
@@ -417,35 +599,74 @@ def run_xai(
 
 
 def main():
-    st.title("Unified Explainable AI Interface (Audio + X-ray)")
+    
+    st.title("Unified Explainable AI Interface")
     st.caption(f"Device: {DEVICE}")
 
-    tab1, tab2 = st.tabs(["Single run", "Compare"])
-
     with st.sidebar:
-        modality = st.radio("Modality", ["Audio (.wav)", "X-ray (image)"], horizontal=False)
 
-        if modality.startswith("Audio"):
-            up = st.file_uploader("Upload FoR audio (.wav)", type=["wav"])
+        st.header("Configuration", divider="red")
+
+        section = st.radio(
+            "Section",
+            ["Deepfake audio detection", "Lung cancer detection"],
+            horizontal=False,
+        )
+
+        st.divider()
+
+        if section == "Deepfake audio detection":
+            modality = "Audio"
+            up = st.file_uploader(
+                "Upload audio (.wav) or spectrogram image",
+                type=["wav", "png", "jpg", "jpeg"],
+            )
+            st.divider()
             model_key = st.selectbox("Audio model", ["audio_vgg16", "audio_resnet50", "audio_mobilenetv2"])
             class_names = AUDIO_CLASSES
         else:
-            up = st.file_uploader("Upload X-ray image", type=["png", "jpg", "jpeg"])
+            modality = "X-ray (image)"
+            up = st.file_uploader("Upload chest X-ray image", type=["png", "jpg", "jpeg"])
+            st.divider()
             model_key = st.selectbox("X-ray model", ["xray_alexnet", "xray_densenet121"])
             class_names = XRAY_CLASSES
 
         if up is None:
             st.stop()
 
-        xai_single = st.selectbox("XAI method (single)", available_xai(modality))
-        xai_multi = st.multiselect("XAI methods (compare)", available_xai(modality), default=["Grad-CAM", "LIME", "SHAP"])
+        # XAI methods are fixed for this app
+        xai_single = "Grad-CAM"
+        xai_multi = ["Grad-CAM", "LIME", "SHAP"]
+
+    st.subheader(section)
+
+    tab1, tab2 = st.tabs(["Result", "Compare"])
 
     model = load_model(model_key)
     file_bytes = up.getvalue()
 
+    # Clear cached XAI + image URIs whenever a new file is uploaded.
+    # (Model weights remain cached via st.cache_resource.)
+    input_sig = hashlib.sha1(file_bytes).hexdigest()
+    last_sig_key = f"last_input_sig_{section}"
+    if st.session_state.get(last_sig_key) != input_sig:
+        st.session_state[last_sig_key] = input_sig
+        st.session_state["xai_cache"] = {}
+        st.session_state["uri_cache"] = {}
+
+    is_wav_audio = (
+        section == "Deepfake audio detection"
+        and hasattr(up, "name")
+        and isinstance(up.name, str)
+        and up.name.lower().endswith(".wav")
+    )
+
     # Prepare input as RGB uint8 + torch tensor
-    if modality.startswith("Audio"):
-        rgb_uint8 = wav_bytes_to_melspec_rgb_uint8_matplotlib(file_bytes)
+    if section == "Deepfake audio detection":
+        if is_wav_audio:
+            rgb_uint8 = wav_bytes_to_melspec_rgb_uint8_matplotlib(file_bytes)
+        else:
+            rgb_uint8 = spectrogram_image_bytes_to_rgb_uint8(file_bytes)
         x = rgb_uint8_to_input_tensor(rgb_uint8)
     else:
         rgb_uint8 = xray_bytes_to_rgb_uint8(file_bytes)
@@ -456,44 +677,107 @@ def main():
     pred_label = class_names[cls]
     pred_score = float(probs[cls])
 
-    # Tab Single
+    # Tab Results
     with tab1:
         c1, c2 = st.columns([1, 1])
 
         with c1:
             st.subheader("Input")
-            if modality.startswith("Audio"):
-                st.image(rgb_uint8, caption="Mel-spectrogram (as image)", use_container_width=True)
-                st.audio(file_bytes, format="audio/wav")
+            if section == "Deepfake audio detection":
+                if is_wav_audio:
+                    st.image(rgb_uint8, caption="Mel-spectrogram (as image)", use_container_width=True)
+                    st.audio(file_bytes, format="audio/wav")
+                else:
+                    st.image(rgb_uint8, caption="Spectrogram image", use_container_width=True)
             else:
                 st.image(rgb_uint8, caption="X-ray (RGB view)", use_container_width=True)
 
         with c2:
             st.subheader("Prediction")
-            st.metric("Predicted class", pred_label, f"{pred_score:.3f}")
+            m1, m2 = st.columns(2)
+            with m1:
+                st.metric(
+                    "Predicted class", 
+                    pred_label, 
+                    f"{pred_score*100:.2f}%",
+                    border=True,
+                    height=140,
+                )
+            with m2:
+                margin = float(abs(probs[1] - probs[0]))
+                st.metric(
+                    "Confidence margin", 
+                    f"{margin*100:.2f}%", 
+                    border=True, 
+                    height=140,
+                )
+
             st.json({class_names[i]: float(probs[i]) for i in range(len(class_names))})
 
-        st.divider()
-        st.subheader(f"XAI: {xai_single}")
-        out = run_xai(xai_single, model, x, rgb_uint8, class_names, model_key)
-        st.image(out, use_container_width=True)
+        ## XAI single output
+        # st.divider()
+        # st.subheader(f"XAI: {xai_single}")
+        # out = run_xai(xai_single, model, x, rgb_uint8, class_names, model_key)
+        # st.image(out, use_container_width=True)
 
     # Tab Compare
     with tab2:
         st.subheader("Compare XAI methods")
-        if len(xai_multi) == 0:
-            st.info("Select at least one method.")
-            st.stop()
+        st.caption("Note: SHAP can be slow; we cap max_evals to keep it usable.")
+        # input_sig computed above
 
-        cols = st.columns(min(3, len(xai_multi)))
+        overlay_mode = st.toggle(
+            "Overlay mode (hover to view original)",
+            value=False,
+            key=f"overlay_mode_{section}_{input_sig}",
+        )
+
+        n_cols = min(3, len(xai_multi))
+        cols = st.columns(n_cols)
+        xai_cache = st.session_state.setdefault("xai_cache", {})
+        uri_cache = st.session_state.setdefault("uri_cache", {})
+
+        orig_uri_key = ("orig", section, input_sig)
+        if orig_uri_key not in uri_cache:
+            uri_cache[orig_uri_key] = _img_to_data_uri_png(_to_uint8(rgb_uint8))
+        orig_uri = uri_cache[orig_uri_key]
+        
         for i, method in enumerate(xai_multi):
             with cols[i % len(cols)]:
                 st.markdown(f"### {method}")
-                out = run_xai(method, model, x, rgb_uint8, class_names, model_key)
-                st.image(out, use_container_width=True)
 
-        st.caption("Note: SHAP can be slow; we cap max_evals to keep it usable.")
+                placeholder = st.empty()
+                placeholder.markdown(
+                    '<div class="xai-loading"><div class="xai-spinner"></div></div>',
+                    unsafe_allow_html=True,
+                )
 
+                cache_key = (section, model_key, input_sig, method)
+                if cache_key in xai_cache:
+                    out = xai_cache[cache_key]
+                else:
+                    out = run_xai(method, model, x, rgb_uint8, class_names, model_key)
+                    out = _resize_rgb_uint8_to_match(out, rgb_uint8)
+                    xai_cache[cache_key] = out
+
+                # Ensure cached outputs are also aligned
+                out = _resize_rgb_uint8_to_match(out, rgb_uint8)
+
+                # overlay mode to display the original on hover
+                if overlay_mode:
+                    xai_uri_key = ("xai", section, model_key, input_sig, method)
+                    if xai_uri_key not in uri_cache:
+                        uri_cache[xai_uri_key] = _img_to_data_uri_png(_to_uint8(out))
+                    xai_uri = uri_cache[xai_uri_key]
+
+                    placeholder.empty()
+                    _render_hover_overlay_component(
+                        xai_uri,
+                        orig_uri,
+                    )
+                else:
+                    placeholder.empty()
+                    st.image(out, use_container_width=True)
 
 
 if __name__ == "__main__":
