@@ -336,7 +336,7 @@ def reconstruct_wav_from_spectrogram_image_bytes(
     img_bytes: bytes,
     *,
     sr: int = AUDIO_SR,
-    seconds: float = AUDIO_SECONDS,
+    seconds: float | None = None,
     cmap_name: str = "magma",
     min_db: float = -80.0,
     max_db: float = 0.0,
@@ -345,8 +345,7 @@ def reconstruct_wav_from_spectrogram_image_bytes(
     n_iter: int = 32,
 ) -> bytes:
     """Reconstruct a WAV preview from a spectrogram image (best-effort).
-
-    Note: This cannot recover the original audio perfectly (phase + scaling are lost).
+    Warning: This cannot recover the original audio perfectly (phase + scaling are lost).
     """
 
     pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
@@ -358,30 +357,32 @@ def reconstruct_wav_from_spectrogram_image_bytes(
     mel_power_a = librosa.db_to_power(db, ref=1.0).astype(np.float32)
     mel_power_b = np.flipud(mel_power_a)
 
-    target_len = int(sr * seconds)
+    # If `seconds` is provided, we force the output duration. Otherwise we let librosa
+    # infer the appropriate length from the spectrogram's time axis. For many uploaded
+    # images, forcing a fixed duration can cause internal frame-count mismatches.
+    target_len = None
+    if seconds is not None:
+        if not np.isfinite(seconds) or seconds <= 0:
+            raise ValueError("`seconds` must be a positive number when provided")
+        target_len = int(sr * float(seconds))
 
-    y_a = librosa.feature.inverse.mel_to_audio(
-        mel_power_a,
+    mel_kwargs = dict(
         sr=sr,
         n_fft=n_fft,
         hop_length=hop_length,
         power=2.0,
         n_iter=n_iter,
-        length=target_len,
-    ).astype(np.float32)
-    y_b = librosa.feature.inverse.mel_to_audio(
-        mel_power_b,
-        sr=sr,
-        n_fft=n_fft,
-        hop_length=hop_length,
-        power=2.0,
-        n_iter=n_iter,
-        length=target_len,
-    ).astype(np.float32)
+    )
+
+    y_a = librosa.feature.inverse.mel_to_audio(mel_power_a, **mel_kwargs).astype(np.float32)
+    y_b = librosa.feature.inverse.mel_to_audio(mel_power_b, **mel_kwargs).astype(np.float32)
 
     score_a = _reconstruction_quality_score(y_a, sr)
     score_b = _reconstruction_quality_score(y_b, sr)
     y = y_a if score_a >= score_b else y_b
+
+    if target_len is not None:
+        y = pad_or_trim(y, sr, float(seconds))
 
     peak = float(np.max(np.abs(y))) if y.size else 0.0
     if peak > 1e-8:
