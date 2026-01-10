@@ -2,6 +2,9 @@
 # **xAI – Deepfake Audio + X-ray XAI (Streamlit)**
 ---
 
+> *HANOUZ Akram, JOUVIN Jules, JALAL Zakaria*<br>
+> *DIA3*
+
 
 > **DISCLAIMER**<br>
 >
@@ -23,6 +26,7 @@
         - [Données supportées](#donn%C3%A9es-support%C3%A9es)
         - [Pré‑traitement important pour la “forme” des XAI](#pr%C3%A9%E2%80%91traitement-important-pour-la-forme-des-xai)
         - [XAI disponibles](#xai-disponibles)
+        - [LLM explanation Ollama](#llm-explanation-ollama)
     - [Entraîner / générer les poids](#entra%C3%AEner--g%C3%A9n%C3%A9rer-les-poids)
     - [Notes pratiques](#notes-pratiques)
 
@@ -57,11 +61,11 @@ python -m venv .venv
 
 Intaller `requirements.txt`.
 ```powershell
-pip install -r requierements.txt
+pip install -r requirements.txt
 ```
 
 Installer torch. Choississez la version de CUDA compatible avec votre GPU. L'example ci-dessous utilise la 12.9.
-```powershel
+```powershell
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu129
 ```
 
@@ -71,6 +75,7 @@ py -m streamlit run app.py
 ```
 
 Pré‑requis : Les poids doivent exister dans `./weights/` (les clés sont définies dans `project/app.py`).
+Pré‑requis (LLM optionnel) : voir section **LLM explanation (Ollama)**.
 
 
 ## **Structure**
@@ -107,6 +112,31 @@ Ce repo contient un notebook d’entraînement (`project/training_models.ipynb`)
 - **SHAP** (masker image + superpixels) : affichage rouge/vert (positif/négatif).
   - **Rouge** : régions qui poussent la prédiction vers la classe expliquée (contribution positive).
   - **Vert** : régions qui la tirent dans l’autre sens (contribution négative).
+
+
+### LLM explanation (Ollama)
+
+Une explication textuelle optionnelle peut être générée via **Ollama** (modèle local par défaut: `gpt-oss:20b`).
+
+- **Aucune image/audio n'est envoyé au LLM** : l'explication est basée sur les probabilités prédites et des **résumés numériques légers** dérivés de Grad-CAM/LIME/SHAP.
+- Aucun outil externe n'est appelé et aucune image/audio n'est transmise au modèle. Vous pouvez donc utiliser n'importe quel modèle local compatible avec Ollama (il n'est pas nécessaire de choisir un modèle « tool-enabled »).
+
+Pré‑requis :
+- Installer Ollama et démarrer le serveur local (par défaut `http://localhost:11434`).
+  ```powershell
+  ollama serve
+  ```
+- Télécharger le modèle que vous souhaitez utilisez. Exemple avec le modèle pas défaut :
+  ```powershell
+  ollama pull gpt-oss:20b
+  ```
+
+Utilisation dans l'app :
+- Dans la sidebar : cocher **Enable Ollama explanation** et configurer `host` + `model`.
+- Onglet **Result** → expander **LLM explanation (Ollama)** → bouton **Generate**.
+- Des résumés textuelles des XAI sont optionnellement utilisés pour générer la réponse du LLM. Si vous les souhaitez, faites bien attention qu'ils ont fini d'être généré dans la section Compare.
+
+Note technique : l'intégration Ollama est encapsulée dans `ollama_llm.py`.
 
 
 ## Entraîner / générer les poids

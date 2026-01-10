@@ -33,6 +33,8 @@ from pytorch_grad_cam.utils.model_targets import BinaryClassifierOutputTarget, C
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from matplotlib.colors import LinearSegmentedColormap
 
+from ollama_llm import OllamaConfig, OllamaError, ollama_generate, build_llm_explanation_prompt
+
 
 
 # =========================
@@ -345,7 +347,7 @@ def reconstruct_wav_from_spectrogram_image_bytes(
     n_iter: int = 32,
 ) -> bytes:
     """Reconstruct a WAV preview from a spectrogram image (best-effort).
-    Warning: This cannot recover the original audio perfectly (phase + scaling are lost).
+    NOTE: This cannot recover the original audio perfectly (phase + scaling are lost).
     """
 
     pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
@@ -600,6 +602,41 @@ def predict_proba(model: nn.Module, x: torch.Tensor) -> np.ndarray:
 # =========================
 
 
+def _summarize_grayscale_cam(grayscale_cam, *, topk: float = 0.10) -> dict:
+    """Compute lightweight numeric stats from a Grad-CAM map in [0, 1]."""
+
+    cam = np.asarray(grayscale_cam, dtype=np.float32)
+    if cam.ndim != 2 or cam.size == 0:
+        return {"available": False}
+
+    cam = np.nan_to_num(cam, nan=0.0, posinf=0.0, neginf=0.0)
+    cam = np.clip(cam, 0.0, 1.0)
+
+    mean_intensity = float(cam.mean())
+    max_intensity = float(cam.max())
+
+    total = float(cam.sum())
+    if total <= 1e-12:
+        com_x, com_y = 0.5, 0.5
+    else:
+        yy, xx = np.indices(cam.shape)
+        com_y = float((yy * cam).sum() / total) / float(cam.shape[0] - 1 if cam.shape[0] > 1 else 1)
+        com_x = float((xx * cam).sum() / total) / float(cam.shape[1] - 1 if cam.shape[1] > 1 else 1)
+
+    k = float(np.clip(topk, 1e-3, 0.5))
+    thr = float(np.quantile(cam.reshape(-1), 1.0 - k))
+    topk_coverage = float((cam >= thr).mean())
+
+    return {
+        "available": True,
+        "mean_intensity": mean_intensity,
+        "max_intensity": max_intensity,
+        "topk": k,
+        "topk_coverage": topk_coverage,
+        "center_of_mass_xy": [com_x, com_y],
+    }
+
+
 def find_last_conv_layer(model: nn.Module):
     """Find the last Conv2d layer in the model. Used for Grad-CAM."""
     last = None
@@ -657,6 +694,8 @@ def gradcam_explain(
     rgb_uint8: np.ndarray,
     class_idx: int,
     model_key: str,
+    *,
+    return_cam: bool = False,
 ):
     """Grad-CAM explanation function."""
 
@@ -680,11 +719,12 @@ def gradcam_explain(
         heat = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
         heat = cv2.cvtColor(heat, cv2.COLOR_BGR2RGB)
         overlay = cv2.addWeighted(rgb_uint8, 0.6, heat, 0.4, 0)
-        return overlay
+        return (overlay, grayscale_cam) if return_cam else overlay
 
     rgb_float = (rgb_uint8.astype(np.float32) / 255.0)
 
-    return show_cam_on_image(rgb_float, grayscale_cam, use_rgb=True)
+    overlay = show_cam_on_image(rgb_float, grayscale_cam, use_rgb=True)
+    return (overlay, grayscale_cam) if return_cam else overlay
 
 
 # =========================
@@ -692,7 +732,7 @@ def gradcam_explain(
 # =========================
 
 
-def lime_explain(rgb_uint8: np.ndarray, model: nn.Module):
+def lime_explain(rgb_uint8: np.ndarray, model: nn.Module, *, return_details: bool = False):
     """LIME explanation function."""
 
     def classifier_fn(images):
@@ -719,7 +759,31 @@ def lime_explain(rgb_uint8: np.ndarray, model: nn.Module):
     label = int(np.argmax(predict_proba(model, rgb_uint8_to_input_tensor(rgb_uint8.astype(np.uint8)))))
     temp, mask = exp.get_image_and_mask(label, positive_only=False, num_features=8, hide_rest=True)
     vis = mark_boundaries(temp / 255.0, mask)
-    return (vis * 255).astype(np.uint8)
+    out_img = (vis * 255).astype(np.uint8)
+
+    if not return_details:
+        return out_img
+
+    mask_arr = np.asarray(mask)
+    selected = float((mask_arr != 0).mean())
+    pos = float((mask_arr > 0).mean())
+    neg = float((mask_arr < 0).mean())
+
+    seg_weights = exp.local_exp.get(label, [])
+    seg_weights_sorted = sorted(seg_weights, key=lambda t: abs(float(t[1])), reverse=True)
+    top = seg_weights_sorted[:8]
+    top_pos = [(int(i), float(w)) for i, w in top if float(w) > 0][:4]
+    top_neg = [(int(i), float(w)) for i, w in top if float(w) < 0][:4]
+
+    details = {
+        "available": True,
+        "selected_pixel_fraction": selected,
+        "positive_pixel_fraction": pos,
+        "negative_pixel_fraction": neg,
+        "top_segments_pos": top_pos,
+        "top_segments_neg": top_neg,
+    }
+    return out_img, details
 
 
 # =========================
@@ -727,7 +791,7 @@ def lime_explain(rgb_uint8: np.ndarray, model: nn.Module):
 # =========================
 
 
-def shap_explain(rgb_uint8: np.ndarray, model: nn.Module, class_names):
+def shap_explain(rgb_uint8: np.ndarray, model: nn.Module, class_names, *, return_details: bool = False):
     """SHAP explanation function"""
 
     def f(images):
@@ -782,7 +846,35 @@ def shap_explain(rgb_uint8: np.ndarray, model: nn.Module, class_names):
     out = fig_to_rgb_uint8(fig)
     plt.close(fig)
 
-    return out
+    if not return_details:
+        return out
+
+    # compute numeric details
+    strong = 0.20
+    pos_frac = float((sv_norm > strong).mean())
+    neg_frac = float((sv_norm < -strong).mean())
+    mean_abs = float(np.mean(np.abs(sv_norm)))
+
+    # top segments by mean contribution
+    seg_means = []
+    for seg_id in np.unique(segments):
+        m = segments == seg_id
+        seg_means.append((int(seg_id), float(sv_seg[m].mean())))
+    seg_means_sorted = sorted(seg_means, key=lambda t: abs(t[1]), reverse=True)[:12]
+    top_pos = [(i, v) for i, v in seg_means_sorted if v > 0][:4]
+    top_neg = [(i, v) for i, v in seg_means_sorted if v < 0][:4]
+
+    # return full details
+    details = {
+        "available": True,
+        "explained_class": str(class_names[cls]) if cls < len(class_names) else str(cls),
+        "positive_fraction_strong": pos_frac,
+        "negative_fraction_strong": neg_frac,
+        "mean_abs_contribution": mean_abs,
+        "top_segments_pos": top_pos,
+        "top_segments_neg": top_neg,
+    }
+    return out, details
 
 
 # =========================
@@ -857,6 +949,18 @@ def main():
             model_key = st.selectbox("X-ray model", ["xray_alexnet", "xray_densenet121"])
             class_names = XRAY_CLASSES
 
+        # Select if LLM explanation is enabled or not
+        st.divider()
+        st.subheader("LLM explanation (local)")
+        enable_llm = st.checkbox("Enable Ollama explanation", value=False)
+        # default values
+        ollama_host = "http://localhost:11434"
+        ollama_model = "gpt-oss:20b"
+        # inputs for ollama configuration
+        if enable_llm:
+            ollama_host = st.text_input("Ollama host", value=ollama_host)
+            ollama_model = st.text_input("Ollama model", value=ollama_model)
+
         if up is None:
             st.stop()
 
@@ -871,7 +975,7 @@ def main():
     model = load_model(model_key)
     file_bytes = up.getvalue()
 
-    # Clear cached XAI + image URIs whenever a new file is uploaded.
+    # Clear cached XAI + image URIs + llm explanations whenever a new file is uploaded.
     # Images are cached in session_state for performance and because the overlay 
     # refresh the page and would restart the xai computation.
     # Deleted otherwise if same file is uploaded again won't recompute xai even 
@@ -883,6 +987,8 @@ def main():
         st.session_state[last_sig_key] = input_sig
         st.session_state["xai_cache"] = {}
         st.session_state["uri_cache"] = {}
+        st.session_state["xai_stats_cache"] = {}
+        st.session_state["llm_cache"] = {}
 
     # Determine if the uploaded file is a WAV audio file to support both audio and spectrogram image inputs.
     is_wav_audio = (
@@ -957,6 +1063,74 @@ def main():
 
             st.json({class_names[i]: float(probs[i]) for i in range(len(class_names))})
 
+            # if llm enables show a section for it
+            if enable_llm:
+                st.divider()
+                with st.expander("LLM explanation (Ollama)", expanded=False):
+                    st.caption(
+                        "Requires a local Ollama server served (see README)."
+                        "No images are being passed to the LLM and no tools support is needed." 
+                        "Therefore, most of ollama's model will work. Write in the sidebar the one you prefer."
+                        "NOTE: for better interpretability wait that the xai methods are computed in the Compare tab first."
+                    )
+
+                    cfg = OllamaConfig(host=ollama_host, model=ollama_model, timeout_s=60.0)
+                    llm_cache = st.session_state.setdefault("llm_cache", {})
+                    llm_key = ("llm", section, model_key, input_sig, cfg.host, cfg.model)
+
+                    b1, b2 = st.columns([1, 2])
+                    with b1:
+                        generate = st.button("Generate", key=f"llm_gen_{section}_{model_key}_{input_sig}")
+                    with b2:
+                        st.write("")
+
+                    if generate:
+                        # Build optional numeric summaries from XAI.
+                        # if any, used the cached stats from gradcam/lime/shap to generate the prompt.
+                        xai_summaries = {}
+                        try:
+                            _, cam_map = gradcam_explain(
+                                model,
+                                x,
+                                rgb_uint8,
+                                cls,
+                                model_key,
+                                return_cam=True,
+                            )
+                            xai_summaries["Grad-CAM"] = _summarize_grayscale_cam(cam_map)
+                        except Exception:
+                            xai_summaries["Grad-CAM"] = {"available": False}
+
+                        stats_cache = st.session_state.get("xai_stats_cache", {})
+                        lime_key = (section, model_key, input_sig, "LIME")
+                        shap_key = (section, model_key, input_sig, "SHAP")
+                        xai_summaries["LIME"] = stats_cache.get(
+                            lime_key, {"available": False, "note": "Run Compare tab to compute."}
+                        )
+                        xai_summaries["SHAP"] = stats_cache.get(
+                            shap_key, {"available": False, "note": "Run Compare tab to compute."}
+                        )
+
+                        prompt = build_llm_explanation_prompt(
+                            task_name=section,
+                            model_key=model_key,
+                            class_names=list(class_names),
+                            probs={class_names[i]: float(probs[i]) for i in range(len(class_names))},
+                            predicted_class=pred_label,
+                            confidence_margin=float(abs(probs[1] - probs[0])),
+                            input_kind=("wav audio" if is_wav_audio else ("spectrogram image" if section == "Deepfake audio detection" else "x-ray image")),
+                            xai_methods=["Grad-CAM", "LIME", "SHAP"],
+                            xai_summaries=xai_summaries,
+                        )
+                        with st.spinner("Calling Ollama…"):
+                            try:
+                                llm_text = ollama_generate(cfg=cfg, prompt=prompt)
+                                llm_cache[llm_key] = llm_text
+                            except OllamaError as e:
+                                st.error(str(e))
+                    if llm_key in llm_cache:
+                        st.markdown(llm_cache[llm_key])
+
         # # XAI single output deprecated for Compare tab
         # st.divider()
         # st.subheader(f"XAI: {xai_single}")
@@ -979,6 +1153,7 @@ def main():
         cols = st.columns(n_cols)
         xai_cache = st.session_state.setdefault("xai_cache", {})
         uri_cache = st.session_state.setdefault("uri_cache", {})
+        xai_stats_cache = st.session_state.setdefault("xai_stats_cache", {})
 
         orig_uri_key = ("orig", section, input_sig)
         if orig_uri_key not in uri_cache:
@@ -1003,7 +1178,27 @@ def main():
                 if cache_key in xai_cache:
                     out = xai_cache[cache_key]
                 else:
-                    out = run_xai(method, model, x, rgb_uint8, class_names, model_key)
+                    # Compute XAI and store lightweight stats for later reuse (e.g., LLM prompt).
+                    if method == "Grad-CAM":
+                        out, cam_map = gradcam_explain(
+                            model,
+                            x,
+                            rgb_uint8,
+                            cls,
+                            model_key,
+                            return_cam=True,
+                        )
+                        xai_stats_cache[cache_key] = _summarize_grayscale_cam(cam_map)
+                    elif method == "LIME":
+                        out, details = lime_explain(rgb_uint8, model, return_details=True)
+                        if isinstance(details, dict):
+                            xai_stats_cache[cache_key] = details
+                    elif method == "SHAP":
+                        out, details = shap_explain(rgb_uint8, model, class_names, return_details=True)
+                        if isinstance(details, dict):
+                            xai_stats_cache[cache_key] = details
+                    else:
+                        out = run_xai(method, model, x, rgb_uint8, class_names, model_key)
                     out = _resize_rgb_uint8_to_match(out, rgb_uint8)
                     xai_cache[cache_key] = out
 
