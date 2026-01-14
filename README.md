@@ -113,6 +113,7 @@ Ce repo contient un notebook d’entraînement (`project/training_models.ipynb`)
   - **Rouge** : régions qui poussent la prédiction vers la classe expliquée (contribution positive).
   - **Vert** : régions qui la tirent dans l’autre sens (contribution négative).
 
+La liste des XAI est definie par extension de fichier dans `./xai_config.py` (ex: `.png`, `.wav`).
 
 ### LLM explanation (Ollama)
 

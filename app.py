@@ -34,6 +34,7 @@ from pytorch_grad_cam.utils.image import show_cam_on_image
 from matplotlib.colors import LinearSegmentedColormap
 
 from ollama_llm import OllamaConfig, OllamaError, ollama_generate, build_llm_explanation_prompt
+from xai_config import get_xai_methods
 
 
 
@@ -882,8 +883,19 @@ def shap_explain(rgb_uint8: np.ndarray, model: nn.Module, class_names, *, return
 # =========================
 
 
-def available_xai(modality: str):
-    return ["Grad-CAM", "LIME", "SHAP"]
+def available_xai(file_ext: str):
+    return get_xai_methods(file_ext)
+
+
+def _infer_upload_extension(uploaded_file) -> str:
+    """Infer the uploaded file extension in lowercase."""
+
+    if uploaded_file is None:
+        return ""
+
+    name = getattr(uploaded_file, "name", "") or ""
+    ext = os.path.splitext(name)[1].lower()
+    return ext
 
 
 def run_xai(
@@ -964,9 +976,12 @@ def main():
         if up is None:
             st.stop()
 
+        upload_ext = _infer_upload_extension(up)
+        upload_label = upload_ext if upload_ext else "file"
+
         # deprecated variables. Before xai methods were variables but both task are on image input.
         xai_single = "Grad-CAM"
-        xai_multi = ["Grad-CAM", "LIME", "SHAP"]
+        xai_multi = available_xai(upload_ext)
 
     st.subheader(section)
 
@@ -1088,28 +1103,32 @@ def main():
                         # Build optional numeric summaries from XAI.
                         # if any, used the cached stats from gradcam/lime/shap to generate the prompt.
                         xai_summaries = {}
-                        try:
-                            _, cam_map = gradcam_explain(
-                                model,
-                                x,
-                                rgb_uint8,
-                                cls,
-                                model_key,
-                                return_cam=True,
-                            )
-                            xai_summaries["Grad-CAM"] = _summarize_grayscale_cam(cam_map)
-                        except Exception:
-                            xai_summaries["Grad-CAM"] = {"available": False}
-
                         stats_cache = st.session_state.get("xai_stats_cache", {})
-                        lime_key = (section, model_key, input_sig, "LIME")
-                        shap_key = (section, model_key, input_sig, "SHAP")
-                        xai_summaries["LIME"] = stats_cache.get(
-                            lime_key, {"available": False, "note": "Run Compare tab to compute."}
-                        )
-                        xai_summaries["SHAP"] = stats_cache.get(
-                            shap_key, {"available": False, "note": "Run Compare tab to compute."}
-                        )
+                        if "Grad-CAM" in xai_multi:
+                            try:
+                                _, cam_map = gradcam_explain(
+                                    model,
+                                    x,
+                                    rgb_uint8,
+                                    cls,
+                                    model_key,
+                                    return_cam=True,
+                                )
+                                xai_summaries["Grad-CAM"] = _summarize_grayscale_cam(cam_map)
+                            except Exception:
+                                xai_summaries["Grad-CAM"] = {"available": False}
+
+                        if "LIME" in xai_multi:
+                            lime_key = (section, model_key, input_sig, "LIME")
+                            xai_summaries["LIME"] = stats_cache.get(
+                                lime_key, {"available": False, "note": "Run Compare tab to compute."}
+                            )
+
+                        if "SHAP" in xai_multi:
+                            shap_key = (section, model_key, input_sig, "SHAP")
+                            xai_summaries["SHAP"] = stats_cache.get(
+                                shap_key, {"available": False, "note": "Run Compare tab to compute."}
+                            )
 
                         prompt = build_llm_explanation_prompt(
                             task_name=section,
@@ -1119,7 +1138,7 @@ def main():
                             predicted_class=pred_label,
                             confidence_margin=float(abs(probs[1] - probs[0])),
                             input_kind=("wav audio" if is_wav_audio else ("spectrogram image" if section == "Deepfake audio detection" else "x-ray image")),
-                            xai_methods=["Grad-CAM", "LIME", "SHAP"],
+                            xai_methods=list(xai_multi),
                             xai_summaries=xai_summaries,
                         )
                         with st.spinner("Calling Ollama…"):
@@ -1141,6 +1160,12 @@ def main():
     with tab2:
         st.subheader("Compare XAI methods")
         st.caption("Note: SHAP can be slow; we cap max_evals to keep it usable.")
+        if xai_multi:
+            method_labels = " ".join(f"`{m}`" for m in xai_multi)
+            st.markdown(f"XAI for {upload_label} type of entry: {method_labels}")
+        else:
+            st.info(f"No XAI methods configured for {upload_label} entries.")
+            return
         # input_sig computed above
 
         overlay_mode = st.toggle(
